@@ -5,12 +5,12 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:logging/logging.dart';
+import 'package:talk/core/providers/global/selected_server_provider.dart';
+import 'package:talk/core/storage/preferences.dart';
 
 import '../core/connection/client.dart';
-import '../core/connection/client_manager.dart';
-import '../core/network/response.dart';
+import '../core/managers/client_manager.dart';
 import '../core/notifiers/current_client_provider.dart';
-import '../core/storage/secure_storage.dart';
 
 class AuthService with ChangeNotifier {
   final Logger _logger = Logger('AuthService');
@@ -36,13 +36,13 @@ class AuthService with ChangeNotifier {
 
   get currentLoggingClient => _currentLoggingClient;
 
-  Future<bool> autoLogin(BuildContext context) async {
+  Future<bool> autoLogin(BuildContext context, {required SelectedServerProvider selectedServerProvider}) async {
     _isLoading = true;
     _errorMessage = null;
     notifyListeners();
 
     try {
-      final bool success = await _performAutologin();
+      final bool success = await _performAutologin(selectedServerProvider: selectedServerProvider);
       _isDone = true;
       if (success) {
         _navigateToChat(context);
@@ -71,10 +71,7 @@ class AuthService with ChangeNotifier {
     try {
       final Completer<String?> completer = Completer();
       _connectToServer(completer, address.host, username: username, password: password);
-      final result = await completer.future;
-      if (result == null || result.isEmpty) {
-        _navigateToChat(context);
-      }
+      await completer.future;
     } catch (e) {
       _errorMessage = 'Login failed: ${e.toString()}';
       _logger.severe(_errorMessage);
@@ -85,15 +82,14 @@ class AuthService with ChangeNotifier {
     return _currentLoggingClient;
   }
 
-  Future<bool> _performAutologin() async {
-    final List<dynamic> servers = await SecureStorage().readJSONArray("servers");
+  Future<bool> _performAutologin({required SelectedServerProvider selectedServerProvider}) async {
+    final servers = await Preferences.getServerList();
     if (servers.isEmpty) {
-      _logger.fine("No servers to autologin");
+      _logger.fine("No servers to autologin to.");
       return false;
     }
 
-    _logger.fine("Autologin to servers: $servers");
-
+    _logger.fine("Attempting to autologin to servers: $servers");
     final List<Completer<String?>> futures = [];
 
     for (var server in servers) {
@@ -104,21 +100,19 @@ class AuthService with ChangeNotifier {
       await _attemptServerLogin(server, futures);
     }
 
-    return await _handleLoginResults(futures);
+    return await _handleLoginResults(futures, selectedServerProvider: selectedServerProvider);
   }
 
   Future<void> _attemptServerLogin(dynamic server, List<Completer<String?>> futures) async {
-    final String? host = await SecureStorage().read("$server.host");
-    final String? token = await SecureStorage().read("$server.token");
 
-    if (host == null || token == null) {
+    if (server['host'] == null || server['token'] == null) {
       return;
     }
 
     _logger.fine("Connecting to server $server");
     final completer = Completer<String?>();
 
-    _connectToServer(completer, host, token: token);
+    _connectToServer(completer, server['host'], token: server['token']);
     futures.add(completer);
   }
 
@@ -126,7 +120,7 @@ class AuthService with ChangeNotifier {
   void _connectToServer(Completer<String?>? completer, String host,
       {String? token, String? username, String? password}) async {
     final client = Client(
-      address: ClientAddress(host: host, port: 3000),
+      address: ClientAddress(host: host, port: 55000),
       onError: (error) {
         completer?.completeError(error);
       },
@@ -141,7 +135,7 @@ class AuthService with ChangeNotifier {
         throw loginResult.error!;
       }
 
-      await _storeLoginData(loginResult, client);
+      await Preferences.addServer(serverId: loginResult.serverId!, host: host, token: loginResult.token!, userId: loginResult.userId!, port: 55000);
       ClientManager().addClient(client);
       completer?.complete(null);
     } catch (e, stacktrace) {
@@ -150,15 +144,8 @@ class AuthService with ChangeNotifier {
     }
   }
 
-  Future<void> _storeLoginData(Login loginResult, Client client) async {
-    final SecureStorage storage = SecureStorage();
-    await storage.write("${loginResult.serverId}.token", loginResult.token!);
-    await storage.write("${loginResult.serverId}.userId", loginResult.userId!);
-    await storage.write("${loginResult.serverId}.host", client.address.host);
-    await storage.write("${loginResult.serverId}.port", client.address.port.toString());
-  }
-
-  Future<bool> _handleLoginResults(List<Completer<String?>> futures) async {
+  Future<bool> _handleLoginResults(List<Completer<String?>> futures,
+      {required SelectedServerProvider selectedServerProvider}) async {
     final List<String?> results = await Future.wait(futures.map((e) => e.future));
     _logger.fine("Connection results: $results");
 
@@ -168,17 +155,33 @@ class AuthService with ChangeNotifier {
       );
 
       if (successClient != null) {
-        CurrentClientProvider().selectClient(successClient);
+        // Check for last logged server
+        final lastVisitedServerId = Preferences.getLastVisitedServerId();
+
+        // Check if the last visited server is still connected
+        final lastVisitedServer = ClientManager().clients.firstWhereOrNull(
+              (client) => client.serverId == lastVisitedServerId,
+        );
+
+        if (lastVisitedServer != null) {
+          _logger.fine("Selecting last visited server: $lastVisitedServer");
+          selectedServerProvider.selectServer(lastVisitedServer);
+          return true;
+        }
+
+        // Server is not available, select the first available server
+        _logger.fine("Selecting first available server: $successClient");
+        selectedServerProvider.selectServer(successClient);
         return true;
       } else {
-        _logger.warning("No client was successfully connected.");
+        _logger.warning("Autologin failed, no client connected.");
       }
     }
     return false;
   }
 
   void _navigateToChat(BuildContext context) {
-    context.go('/chat');
+    context.goNamed('chat');
   }
 
   abortLogin() {
